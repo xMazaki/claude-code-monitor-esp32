@@ -20,6 +20,8 @@ using fs::FS;
 #include <Preferences.h>
 #include <ArduinoOTA.h>
 #include <time.h>
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
 
 #include "claude_logo.h"
 
@@ -119,7 +121,7 @@ float animFiveHour = 0;
 float animSevenDay = 0;
 unsigned long lastAnimMs = 0;
 unsigned long lastRedrawMs = 0;
-#define ANIM_FRAME_MS 33
+#define ANIM_FRAME_MS 16
 
 // Etat du flash one-shot lorsqu'un seuil est franchi a la hausse.
 bool flash5hActive = false;
@@ -191,17 +193,26 @@ void initNTP();
 void rebootSoon();
 
 void setup() {
+  // Desactive le brownout detector : sur les Guition JC2432W328 alimentees par
+  // un port USB de PC, le pic de courant a l'activation WiFi (jusqu'a 500 mA)
+  // peut faire chuter la tension sous le seuil du BOD, ce qui declenche un
+  // reset en boucle. La carte a assez de capacite decouplee pour encaisser
+  // ces pics, on peut donc desactiver la securite sans dommage.
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
   Serial.begin(115200);
-  delay(100);
-  Serial.println("\n[BOOT] Claude Code Monitor v1.1");
+  Serial.println("\n[BOOT] Claude Code Monitor v1.2");
 
   bootTime = millis();
   loadPrefs();
 
   tft.init();
   tft.setRotation(1);
-  pinMode(27, OUTPUT);
-  digitalWrite(27, HIGH);
+
+  // Backlight pilote en PWM (LEDC). Demarre eteint pour faire un fade-in apres
+  // avoir dessine le splash. API ESP32 core 3.x : ledcAttach(pin, freq, res).
+  ledcAttach(27, 5000, 8);
+  ledcWrite(27, 0);
   tft.fillScreen(COL_BG);
 
   // Splash
@@ -212,6 +223,13 @@ void setup() {
   tft.drawString("Claude Code Monitor", SCREEN_W / 2, 145, 4);
   tft.setTextColor(COL_DIM, COL_BG);
   tft.drawString("Connexion WiFi...", SCREEN_W / 2, 180, 2);
+
+  // Fade-in : 0 -> 255 sur ~300 ms.
+  for (int b = 0; b <= 255; b += 8) {
+    ledcWrite(27, b);
+    delay(8);
+  }
+  ledcWrite(27, 255);
 
   sprGaugeL.setColorDepth(16);
   sprGaugeR.setColorDepth(16);
@@ -234,9 +252,6 @@ void setup() {
 
   // Le premier fetch est differe a la loop pour que l'UI s'affiche tout de
   // suite et que le portail web reste joignable meme si l'API est bloquee.
-
-  delay(300);
-
   if (sessionKey.length() == 0) {
     currentView = VIEW_ERROR;
     drawError(wifiOk
@@ -252,9 +267,32 @@ void loop() {
   unsigned long now = millis();
   int tx, ty;
 
+  // Yield explicite : evite le watchdog Task et permet aux taches systeme
+  // (WiFi, lwIP) de tourner. Sans ca, une iteration de loop trop chargee
+  // peut declencher un reboot apres ~3 s.
+  yield();
+
   if (wifiOk) {
     webServer.handleClient();
     ArduinoOTA.handle();
+  }
+
+  // Log diagnostic toutes les 30 s pour pouvoir reperer un drift heap.
+  static unsigned long lastDiagMs = 0;
+  if (now - lastDiagMs > 30000) {
+    lastDiagMs = now;
+    Serial.printf("[DIAG] up=%lus heap=%u/%u (largest=%u) rssi=%d view=%d valid=%d fails=%d\n",
+                  (now - bootTime) / 1000,
+                  ESP.getFreeHeap(), ESP.getHeapSize(),
+                  ESP.getMaxAllocHeap(),
+                  wifiOk ? WiFi.RSSI() : 0,
+                  currentView, usage.valid,
+                  consecutiveFetchFailures);
+    // Garde-fou : si la heap libre tombe sous 20 Ko, on previent au log
+    // pour que tu puisses reperer dans quel scenario ca arrive.
+    if (ESP.getFreeHeap() < 20000) {
+      Serial.println("[DIAG] WARNING heap critique");
+    }
   }
 
   if (pendingRebootAt > 0 && now >= pendingRebootAt) {
@@ -265,6 +303,54 @@ void loop() {
 
   // Pendant un OTA, l'ecran est prit par les callbacks ArduinoOTA.
   if (otaActive) return;
+
+  // Watchdog WiFi : si on perd la connexion en cours de route (router qui
+  // reboot, mise en veille longue, etc.), on retente proprement toutes les
+  // 30 s. Evite la boucle "connexion WiFi..." qui ne sortait que par un
+  // debranchement / rebranchement physique.
+  static unsigned long lastWifiCheckMs = 0;
+  if (now - lastWifiCheckMs > 30000) {
+    lastWifiCheckMs = now;
+    bool connected = (WiFi.status() == WL_CONNECTED);
+    if (wifiOk && !connected) {
+      Serial.println("[WIFI] connection lost, reconnecting...");
+      wifiOk = false;
+      WiFi.disconnect();
+      delay(100);
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
+    } else if (!wifiOk && connected) {
+      wifiOk = true;
+      Serial.printf("[WIFI] reconnected: %s\n", WiFi.localIP().toString().c_str());
+      // Reseau de retour : on retente immediatement les services.
+      if (!timeReady) initNTP();
+      lastFetchAttemptMs = 0;
+      consecutiveFetchFailures = 0;
+    } else if (!wifiOk && !connected) {
+      // Toujours pas connecte : on relance proprement WiFi.begin().
+      Serial.println("[WIFI] still down, retrying...");
+      WiFi.disconnect();
+      delay(100);
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
+    }
+  }
+
+  // Watchdog NTP : si la 1re synchro a echoue (timeReady reste a false),
+  // on retente tant qu'on a du WiFi pour qu'on n'ait plus jamais a rebooter
+  // pour voir l'heure s'afficher correctement.
+  static unsigned long lastNtpCheckMs = 0;
+  if (!timeReady && wifiOk && now - lastNtpCheckMs > 10000) {
+    lastNtpCheckMs = now;
+    struct tm t;
+    if (getLocalTime(&t, 200)) {
+      timeReady = true;
+      Serial.printf("[NTP] late sync OK: %02d:%02d:%02d\n",
+                    t.tm_hour, t.tm_min, t.tm_sec);
+      // Force le repush du sprite time pour effacer le "--:--"
+      lastTimeStr = "";
+    } else {
+      Serial.println("[NTP] still waiting...");
+    }
+  }
 
   bool touchPresent = touchRead(&tx, &ty);
   if (touchPresent) {
@@ -329,7 +415,8 @@ void loop() {
 
     bool animMoved = false;
     if (usage.valid) {
-      float dt = 0.15f;
+      // Ease-out doux a 60 FPS : convergence en ~600ms.
+      const float dt = 0.12f;
       float diff5 = usage.fiveHourPct - animFiveHour;
       float diff7 = usage.sevenDayPct - animSevenDay;
       if (fabs(diff5) > 0.05 || fabs(diff7) > 0.05) {
@@ -381,7 +468,19 @@ void loop() {
 
 void connectWiFi() {
   Serial.printf("[WIFI] Connecting to %s...\n", WIFI_SSID);
+  // Sequence robuste : on coupe proprement avant de se reconnecter pour
+  // eviter les boucles "connexion..." infinies apres une longue mise en veille.
+  WiFi.disconnect(true, true);
+  delay(100);
+  WiFi.mode(WIFI_OFF);
+  delay(100);
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);  // bug connu : le power-save WiFi de l'ESP32 cause
+                         // des deconnexions silencieuses sur certains AP
+  WiFi.setAutoReconnect(true);
+  // Reduit la puissance d'emission de 20 dBm a 17 dBm pour diminuer le pic
+  // de courant a la connexion (-> moins de risque de brownout sur USB faible).
+  WiFi.setTxPower(WIFI_POWER_17dBm);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
 
   unsigned long start = millis();
@@ -1264,19 +1363,8 @@ void initNTP() {
   setenv("TZ", tzName.c_str(), 1);
   tzset();
   configTzTime(tzName.c_str(), NTP_SERVER_1, NTP_SERVER_2);
-  // Premiere synchro : on attend max 5 s, sinon on laisse l'arriere-plan finir.
-  struct tm t;
-  for (int i = 0; i < 25; i++) {
-    if (getLocalTime(&t, 200)) {
-      timeReady = true;
-      Serial.printf("[NTP] OK: %04d-%02d-%02d %02d:%02d:%02d\n",
-                    t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
-                    t.tm_hour, t.tm_min, t.tm_sec);
-      return;
-    }
-    delay(100);
-  }
-  Serial.println("[NTP] First sync failed (will keep trying in background)");
+  // Synchro non-bloquante : le watchdog NTP de la loop() s'occupera de
+  // detecter quand la 1re sync est dispo (gain ~3-5s sur le boot).
 }
 
 // Reboot differe : laisse le temps au HTTP response du portail d'etre envoyee.
@@ -1310,8 +1398,14 @@ String htmlEscape(const String& s) {
 
 void handleRoot() {
   if (!webAuthOk()) return;
+  // Refus si la heap est trop basse : un fetch en cours + un client web qui
+  // demande la page (10 Ko de string) peut crasher.
+  if (ESP.getFreeHeap() < 30000) {
+    webServer.send(503, "text/plain", "Busy, retry in a moment");
+    return;
+  }
   String html;
-  html.reserve(6000);
+  html.reserve(8000);
   html += F("<!DOCTYPE html><html lang='fr'><head><meta charset='utf-8'>"
            "<meta name='viewport' content='width=device-width,initial-scale=1'>"
            "<title>Claude Monitor</title>"

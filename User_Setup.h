@@ -35,7 +35,9 @@
 #define TFT_BACKLIGHT_ON HIGH
 
 // ─── SPI FREQUENCY ──────────────────────────────────────────
-#define SPI_FREQUENCY       55000000
+// 80 MHz : max supporté par le ST7789 du Guition, ~30% de gain FPS sur les
+// pushSprite vs 55 MHz. Si tu as des glitchs d'affichage, repasser à 55 MHz.
+#define SPI_FREQUENCY       80000000
 #define SPI_READ_FREQUENCY  20000000
 #define SPI_TOUCH_FREQUENCY  2500000
 
