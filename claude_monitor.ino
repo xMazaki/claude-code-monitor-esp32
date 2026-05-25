@@ -48,6 +48,15 @@ int thresholdWeekly7dAlert  = 90;
 String defaultBootView = "clock";
 String tzName = "CET-1CEST,M3.5.0,M10.5.0/3";
 
+// Mode veille auto : dim du backlight apres un delai sans interaction.
+bool  sleepEnabled    = false;          // active/desactive le mode veille
+int   sleepDelayMin   = 5;              // delai avant dim (minutes)
+int   sleepDimPercent = 10;             // luminosite dimmed (0-100%)
+// Etat runtime
+bool  isDimmed = false;
+unsigned long lastActivityMs = 0;
+#define BACKLIGHT_PIN 27
+
 const char* NTP_SERVER_1 = "pool.ntp.org";
 const char* NTP_SERVER_2 = "time.google.com";
 bool timeReady = false;
@@ -191,6 +200,10 @@ void setupWebServer();
 void setupOTA();
 void initNTP();
 void rebootSoon();
+void setBacklight(uint8_t level);
+void fadeBacklight(uint8_t from, uint8_t to, int durationMs);
+void wakeFromDim();
+void checkSleepTimeout();
 
 void setup() {
   // Desactive le brownout detector : sur les Guition JC2432W328 alimentees par
@@ -211,8 +224,8 @@ void setup() {
 
   // Backlight pilote en PWM (LEDC). Demarre eteint pour faire un fade-in apres
   // avoir dessine le splash. API ESP32 core 3.x : ledcAttach(pin, freq, res).
-  ledcAttach(27, 5000, 8);
-  ledcWrite(27, 0);
+  ledcAttach(BACKLIGHT_PIN, 5000, 8);
+  setBacklight(0);
   tft.fillScreen(COL_BG);
 
   // Splash
@@ -224,12 +237,9 @@ void setup() {
   tft.setTextColor(COL_DIM, COL_BG);
   tft.drawString("Connexion WiFi...", SCREEN_W / 2, 180, 2);
 
-  // Fade-in : 0 -> 255 sur ~300 ms.
-  for (int b = 0; b <= 255; b += 8) {
-    ledcWrite(27, b);
-    delay(8);
-  }
-  ledcWrite(27, 255);
+  // Fade-in du backlight (0 -> 255 sur ~300 ms).
+  fadeBacklight(0, 255, 300);
+  lastActivityMs = millis();
 
   sprGaugeL.setColorDepth(16);
   sprGaugeR.setColorDepth(16);
@@ -354,6 +364,17 @@ void loop() {
 
   bool touchPresent = touchRead(&tx, &ty);
   if (touchPresent) {
+    // Toute interaction tactile reveille l'ecran si on etait en mode veille.
+    // Si on etait dim, on consomme ce premier touch juste pour reveiller
+    // (pas d'action declenchee) pour eviter qu'un toucher accidentel
+    // declenche un refresh / changement de vue.
+    if (isDimmed) {
+      wakeFromDim();
+      touchStartMs = 0;
+      lastTouchEndMs = now;
+      return;
+    }
+    lastActivityMs = now;
     if (touchStartMs == 0) {
       touchStartMs = now;
       touchStartX = tx;
@@ -464,6 +485,9 @@ void loop() {
     lastRedrawMs = now;
     drawStatusBar();
   }
+
+  // Mode veille auto : verifie si le delai d'inactivite est ecoule.
+  checkSleepTimeout();
 }
 
 void connectWiFi() {
@@ -1333,6 +1357,9 @@ void loadPrefs() {
   thresholdWeekly7dAlert  = prefs.getInt("th7a",       90);
   defaultBootView         = prefs.getString("boot",    "clock");
   tzName                  = prefs.getString("tz",      "CET-1CEST,M3.5.0,M10.5.0/3");
+  sleepEnabled            = prefs.getBool("slpEn",     false);
+  sleepDelayMin           = prefs.getInt("slpDel",     5);
+  sleepDimPercent         = prefs.getInt("slpDim",     10);
   prefs.end();
   Serial.printf("[PREFS] sk=%d chars, org=%s, base=%s, refresh=%lums, boot=%s\n",
                 sessionKey.length(),
@@ -1353,6 +1380,9 @@ void savePrefs() {
   prefs.putInt("th7a",       thresholdWeekly7dAlert);
   prefs.putString("boot",    defaultBootView);
   prefs.putString("tz",      tzName);
+  prefs.putBool("slpEn",     sleepEnabled);
+  prefs.putInt("slpDel",     sleepDelayMin);
+  prefs.putInt("slpDim",     sleepDimPercent);
   prefs.end();
   Serial.println("[PREFS] saved");
 }
@@ -1369,6 +1399,45 @@ void initNTP() {
 
 // Reboot differe : laisse le temps au HTTP response du portail d'etre envoyee.
 void rebootSoon() { pendingRebootAt = millis() + 1500; }
+
+// Ecrit la luminosite (0-255) sur le backlight PWM.
+void setBacklight(uint8_t level) {
+  ledcWrite(BACKLIGHT_PIN, level);
+}
+
+// Fait un fade progressif de la luminosite actuelle vers une cible.
+void fadeBacklight(uint8_t from, uint8_t to, int durationMs) {
+  if (from == to) { setBacklight(to); return; }
+  int steps = 20;
+  int delayPerStep = durationMs / steps;
+  if (delayPerStep < 1) delayPerStep = 1;
+  for (int i = 1; i <= steps; i++) {
+    int v = from + ((int)(to - from) * i) / steps;
+    setBacklight((uint8_t)v);
+    delay(delayPerStep);
+  }
+}
+
+// Reveille l'ecran si on etait en mode dim. Doit etre appele a chaque
+// interaction (touch, web portal action, etc.).
+void wakeFromDim() {
+  lastActivityMs = millis();
+  if (isDimmed) {
+    isDimmed = false;
+    fadeBacklight(map(sleepDimPercent, 0, 100, 0, 255), 255, 200);
+  }
+}
+
+// Verifie si on doit entrer en veille. Appele depuis la loop.
+void checkSleepTimeout() {
+  if (!sleepEnabled || isDimmed) return;
+  unsigned long elapsedMs = millis() - lastActivityMs;
+  if (elapsedMs > (unsigned long)sleepDelayMin * 60UL * 1000UL) {
+    isDimmed = true;
+    Serial.printf("[SLEEP] dim to %d%%\n", sleepDimPercent);
+    fadeBacklight(255, map(sleepDimPercent, 0, 100, 0, 255), 600);
+  }
+}
 
 
 // Returns true if the request is authorized (or if auth is disabled).
@@ -1520,6 +1589,18 @@ void handleRoot() {
   if (matched) html += " style='display:none'";
   html += ">";
 
+  html += F("<h2>Mode veille</h2><div class='card'>");
+  html += F("<label><input type='checkbox' name='slpEn' value='1' style='width:auto;margin-right:8px'");
+  if (sleepEnabled) html += F(" checked");
+  html += F(">Activer le mode veille auto</label>");
+  html += F("<label>Delai avant veille (minutes)</label>");
+  html += "<input type='number' name='slpDel' min='1' max='60' value='" +
+          String(sleepDelayMin) + "'>";
+  html += F("<label>Luminosite en veille (%)</label>");
+  html += "<input type='number' name='slpDim' min='0' max='100' value='" +
+          String(sleepDimPercent) + "'>";
+  html += F("</div>");
+
   html += F("<h2>Seuils d'alerte</h2>"
            "<div class='grid2'>"
            "<div><label>Session 5h orange (%)</label>");
@@ -1597,6 +1678,17 @@ void handleSave() {
   getPct("th5a", thresholdSession5hAlert);
   getPct("th7w", thresholdWeekly7dWarn);
   getPct("th7a", thresholdWeekly7dAlert);
+
+  // Mode veille : la checkbox HTML n'envoie l'arg que si elle est cochee.
+  sleepEnabled = webServer.hasArg("slpEn");
+  if (webServer.hasArg("slpDel")) {
+    int v = webServer.arg("slpDel").toInt();
+    if (v >= 1 && v <= 60) sleepDelayMin = v;
+  }
+  getPct("slpDim", sleepDimPercent);
+  // Si on vient de modifier les reglages, reset le timer d'inactivite et
+  // sortir du mode dim si on y etait pour appliquer immediatement.
+  wakeFromDim();
 
   savePrefs();
   // Reset du backoff : la prochaine iteration retente immediatement avec

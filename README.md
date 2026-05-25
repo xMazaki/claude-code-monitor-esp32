@@ -34,8 +34,9 @@ couleurs officielles d'Anthropic.
 - **Heure locale** : conversion automatique UTC → ton fuseau (presets Europe/US/Asie/Pacifique)
 - **Countdown live** : "dans 2h15" au lieu d'une heure absolue
 - **Refresh manuel** par tap, **réglages on-device** par appui long
+- **Mode veille auto** : dim progressif du backlight après un délai d'inactivité, réveil instantané au touch
 - **Portail web** (HTTP sur le port 80) : configurer la sessionKey, l'orgUuid,
-  l'URL du proxy, les seuils, l'intervalle de refresh, la vue par défaut, le fuseau horaire, reboot
+  l'URL du proxy, les seuils, l'intervalle de refresh, la vue par défaut, le fuseau horaire, le mode veille, reboot
 - **OTA** (Over-The-Air) : flasher de nouvelles versions sans câble USB depuis
   Arduino IDE
 - **NVS** : tous les réglages survivent aux reboots
@@ -226,6 +227,7 @@ Tu peux y :
 - Définir la vue par défaut au boot
 - Choisir un fuseau horaire (presets Europe/US/Asie + champ POSIX TZ avancé)
 - Ajuster les 4 seuils de couleur (orange/rouge pour 5h et 7j)
+- Activer le mode veille auto + régler le délai et la luminosité dimmed
 - Forcer un fetch immédiat ou rebooter
 - Accéder à `/usage.json` pour intégrer dans Home Assistant, scripts, etc.
 
@@ -333,5 +335,5 @@ MIT - fais-en ce que tu veux. Les marques "Claude" et "Anthropic" appartiennent
 ## Contribuer
 
 Issues et PR bienvenues. Idées de features potentielles dans le code mais pas
-implémentées : countdown vocal/buzzer, mode veille auto avec dim du backlight,
-breakdown par modèle (Opus/Sonnet/Haiku), historique 24h en graphique sparkline.
+implémentées : countdown vocal/buzzer, breakdown par modèle (Opus/Sonnet/Haiku),
+historique 24h en graphique sparkline.
