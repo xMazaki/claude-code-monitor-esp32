@@ -623,10 +623,28 @@ int claudeGet(const String& path, String& bodyOut) {
   Serial.printf("[HTTP] code=%d, body length=%d, heap after=%u kB\n",
                 code, bodyOut.length(), ESP.getFreeHeap() / 1024);
 
-  if (hadGaugeL) sprGaugeL.createSprite(140, 150);
-  if (hadGaugeR) sprGaugeR.createSprite(140, 150);
-  if (hadStatus) sprStatus.createSprite(SCREEN_W, 18);
-  if (hadTime)   sprTime.createSprite(220, 56);
+  // Recreation des sprites avec retry : si la heap est trop fragmentee a
+  // l'instant T (peut arriver apres un fetch TLS), createSprite() retourne
+  // 0 silencieusement et la zone ne s'affiche plus. On retente jusqu'a 3 fois
+  // en yieldant entre chaque pour laisser le scheduler defragmenter.
+  auto recreateWithRetry = [](TFT_eSprite& s, int w, int h, const char* name) {
+    if (!s.created()) {
+      for (int attempt = 0; attempt < 3; attempt++) {
+        if (s.createSprite(w, h)) {
+          if (attempt > 0) Serial.printf("[SPR] %s recreated (attempt %d)\n", name, attempt + 1);
+          return;
+        }
+        Serial.printf("[SPR] %s create failed (heap=%u largest=%u), retry...\n",
+                      name, ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+        delay(50);
+      }
+      Serial.printf("[SPR] %s create FAILED definitively\n", name);
+    }
+  };
+  if (hadGaugeL) recreateWithRetry(sprGaugeL, 140, 150, "gaugeL");
+  if (hadGaugeR) recreateWithRetry(sprGaugeR, 140, 150, "gaugeR");
+  if (hadStatus) recreateWithRetry(sprStatus, SCREEN_W, 18, "status");
+  if (hadTime)   recreateWithRetry(sprTime, 220, 56, "time");
 
   // Apres recreation des sprites, on invalide les caches pour que le prochain
   // tick d'anim redessine les zones utiles SANS full fillScreen (sinon l'ecran
@@ -813,8 +831,54 @@ void redrawHeaderLogo() {
 
 // Dessine une jauge circulaire dans le sprite passe puis le pousse en (px, py).
 // flashOn = effet inverse video pour signaler le franchissement d'un seuil.
+// Fallback : dessine la jauge directement sur tft (sans sprite).
+// Utilise quand le sprite n'a pas pu etre cree (heap fragmentee). Anti-flicker
+// en moins mais au moins la jauge reste visible.
+void drawGaugeDirect(int px, int py, float pct, const char* label,
+                     const char* sub, uint16_t color, bool flashOn) {
+  const int sw = 140;
+  const int sh = 150;
+  const int cx = px + sw / 2;
+  const int cy = py + 56;
+  const int r = 52;
+
+  uint16_t bg = flashOn ? color : COL_BG;
+  uint16_t ringFg = flashOn ? COL_TEXT : color;
+  uint16_t ringBg = flashOn ? color : COL_CARD;
+
+  tft.fillRect(px, py, sw, sh, bg);
+  tft.drawSmoothArc(cx, cy, r, r - 9, 30, 330, ringBg, bg);
+  if (pct >= 1.0) {
+    int sweep = 300;
+    int endAngle = 30 + (int)(sweep * (pct / 100.0));
+    if (endAngle > 330) endAngle = 330;
+    tft.drawSmoothArc(cx, cy, r, r - 9, 30, endAngle, ringFg, bg);
+  }
+  char valBuf[8];
+  snprintf(valBuf, sizeof(valBuf), "%d", (int)round(pct));
+  tft.setTextColor(flashOn ? COL_BG : COL_TEXT, bg);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString(valBuf, cx - 1, cy + 4, 4);
+  int approxW = 14 * strlen(valBuf);
+  tft.setTextColor(flashOn ? COL_BG : COL_DIM, bg);
+  tft.setTextDatum(BL_DATUM);
+  tft.drawString("%", cx + approxW / 2 + 1, cy + 10, 2);
+  tft.setTextColor(flashOn ? COL_BG : color, bg);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString(label, cx, cy + r + 12, 2);
+  tft.setTextColor(flashOn ? COL_BG : COL_DIM, bg);
+  tft.drawString(sub, cx, cy + r + 28, 1);
+}
+
 void drawGaugeInto(TFT_eSprite& s, int px, int py, float pct,
                    const char* label, const char* sub, uint16_t color, bool flashOn) {
+  // Fallback : si le sprite n'a pas pu etre cree, on dessine direct sur tft.
+  // La jauge sera quand meme visible (juste un peu de flicker en plus).
+  if (!s.created()) {
+    drawGaugeDirect(px, py, pct, label, sub, color, flashOn);
+    return;
+  }
+
   const int sw = 140;
   const int sh = 150;
   const int cx = sw / 2;
@@ -1006,6 +1070,24 @@ bool flashPhaseOn(unsigned long startMs) {
 // Refresh only the two gauges + status bar (called every animation frame)
 void updateGaugesAnim() {
   if (currentView != VIEW_GAUGES || !usage.valid) return;
+
+  // Garde-fou : si l'un des 2 sprites n'existe plus (rare, peut arriver apres
+  // un fetch TLS qui a fragmente la heap a un mauvais moment), on tente de
+  // le recreer ici sinon la jauge ne s'affiche pas du tout.
+  if (!sprGaugeL.created()) {
+    sprGaugeL.setColorDepth(16);
+    if (!sprGaugeL.createSprite(140, 150)) {
+      Serial.printf("[SPR] gaugeL re-create failed in update (heap=%u largest=%u)\n",
+                    ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    }
+  }
+  if (!sprGaugeR.created()) {
+    sprGaugeR.setColorDepth(16);
+    if (!sprGaugeR.createSprite(140, 150)) {
+      Serial.printf("[SPR] gaugeR re-create failed in update (heap=%u largest=%u)\n",
+                    ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    }
+  }
 
   const int gaugeTop = 46;
   const int leftPx = (SCREEN_W / 2 - 140) / 2;
