@@ -48,6 +48,9 @@ int thresholdWeekly7dAlert  = 90;
 String defaultBootView = "clock";
 String tzName = "CET-1CEST,M3.5.0,M10.5.0/3";
 
+// Luminosite du backlight quand l'ecran est "allume" (mode normal).
+int   brightPercent   = 100;            // 0-100%
+
 // Mode veille auto : dim du backlight apres un delai sans interaction.
 bool  sleepEnabled    = false;          // active/desactive le mode veille
 int   sleepDelayMin   = 5;              // delai avant dim (minutes)
@@ -56,6 +59,11 @@ int   sleepDimPercent = 10;             // luminosite dimmed (0-100%)
 bool  isDimmed = false;
 unsigned long lastActivityMs = 0;
 #define BACKLIGHT_PIN 27
+
+// Wake on alert : quand un seuil est franchi alors que l'ecran est dim, on
+// rallume temporairement pendant ce delai puis on retombe en veille.
+#define ALERT_WAKE_MS 30000UL
+unsigned long alertWakeUntilMs = 0;
 
 const char* NTP_SERVER_1 = "pool.ntp.org";
 const char* NTP_SERVER_2 = "time.google.com";
@@ -201,6 +209,8 @@ void setupOTA();
 void initNTP();
 void rebootSoon();
 void setBacklight(uint8_t level);
+uint8_t brightPwm();
+uint8_t dimPwm();
 void fadeBacklight(uint8_t from, uint8_t to, int durationMs);
 void wakeFromDim();
 void checkSleepTimeout();
@@ -237,8 +247,8 @@ void setup() {
   tft.setTextColor(COL_DIM, COL_BG);
   tft.drawString("Connexion WiFi...", SCREEN_W / 2, 180, 2);
 
-  // Fade-in du backlight (0 -> 255 sur ~300 ms).
-  fadeBacklight(0, 255, 300);
+  // Fade-in du backlight (0 -> luminosite configuree sur ~300 ms).
+  fadeBacklight(0, brightPwm(), 300);
   lastActivityMs = millis();
 
   sprGaugeL.setColorDepth(16);
@@ -1158,14 +1168,27 @@ void checkThresholdFlashes() {
   bool now7W = usage.sevenDayPct >= thresholdWeekly7dWarn;
   bool now7A = usage.sevenDayPct >= thresholdWeekly7dAlert;
 
-  if ((now5W && !prev5hOverWarn) || (now5A && !prev5hOverAlert)) {
+  bool crossed5 = (now5W && !prev5hOverWarn) || (now5A && !prev5hOverAlert);
+  bool crossed7 = (now7W && !prev7dOverWarn) || (now7A && !prev7dOverAlert);
+
+  if (crossed5) {
     flash5hActive = true;
     flash5hStartMs = millis();
   }
-  if ((now7W && !prev7dOverWarn) || (now7A && !prev7dOverAlert)) {
+  if (crossed7) {
     flash7dActive = true;
     flash7dStartMs = millis();
   }
+
+  // Wake on alert : si un seuil vient d'etre franchi a la hausse alors qu'on
+  // est en veille, on rallume l'ecran pour ALERT_WAKE_MS puis on retombera
+  // en dim via checkSleepTimeout().
+  if ((crossed5 || crossed7) && isDimmed) {
+    Serial.println("[ALERT] threshold crossed during sleep, waking up");
+    wakeFromDim();
+    alertWakeUntilMs = millis() + ALERT_WAKE_MS;
+  }
+
   prev5hOverWarn = now5W;
   prev5hOverAlert = now5A;
   prev7dOverWarn = now7W;
@@ -1360,6 +1383,7 @@ void loadPrefs() {
   sleepEnabled            = prefs.getBool("slpEn",     false);
   sleepDelayMin           = prefs.getInt("slpDel",     5);
   sleepDimPercent         = prefs.getInt("slpDim",     10);
+  brightPercent           = prefs.getInt("bright",     100);
   prefs.end();
   Serial.printf("[PREFS] sk=%d chars, org=%s, base=%s, refresh=%lums, boot=%s\n",
                 sessionKey.length(),
@@ -1383,6 +1407,7 @@ void savePrefs() {
   prefs.putBool("slpEn",     sleepEnabled);
   prefs.putInt("slpDel",     sleepDelayMin);
   prefs.putInt("slpDim",     sleepDimPercent);
+  prefs.putInt("bright",     brightPercent);
   prefs.end();
   Serial.println("[PREFS] saved");
 }
@@ -1405,6 +1430,16 @@ void setBacklight(uint8_t level) {
   ledcWrite(BACKLIGHT_PIN, level);
 }
 
+// Renvoie la valeur PWM correspondant a la luminosite "allume" configuree.
+uint8_t brightPwm() {
+  return (uint8_t)map(brightPercent, 0, 100, 0, 255);
+}
+
+// Renvoie la valeur PWM correspondant a la luminosite "veille" configuree.
+uint8_t dimPwm() {
+  return (uint8_t)map(sleepDimPercent, 0, 100, 0, 255);
+}
+
 // Fait un fade progressif de la luminosite actuelle vers une cible.
 void fadeBacklight(uint8_t from, uint8_t to, int durationMs) {
   if (from == to) { setBacklight(to); return; }
@@ -1422,20 +1457,27 @@ void fadeBacklight(uint8_t from, uint8_t to, int durationMs) {
 // interaction (touch, web portal action, etc.).
 void wakeFromDim() {
   lastActivityMs = millis();
+  // Toute interaction utilisateur annule la fenetre de wake forcee
+  // (alerte de seuil) : on repart sur le delai standard.
+  alertWakeUntilMs = 0;
   if (isDimmed) {
     isDimmed = false;
-    fadeBacklight(map(sleepDimPercent, 0, 100, 0, 255), 255, 200);
+    fadeBacklight(dimPwm(), brightPwm(), 200);
   }
 }
 
 // Verifie si on doit entrer en veille. Appele depuis la loop.
 void checkSleepTimeout() {
   if (!sleepEnabled || isDimmed) return;
-  unsigned long elapsedMs = millis() - lastActivityMs;
+  unsigned long now = millis();
+  // Si on est en wake forcee suite a une alerte, on attend la fin du delai.
+  if (alertWakeUntilMs > 0 && now < alertWakeUntilMs) return;
+  unsigned long elapsedMs = now - lastActivityMs;
   if (elapsedMs > (unsigned long)sleepDelayMin * 60UL * 1000UL) {
     isDimmed = true;
+    alertWakeUntilMs = 0;
     Serial.printf("[SLEEP] dim to %d%%\n", sleepDimPercent);
-    fadeBacklight(255, map(sleepDimPercent, 0, 100, 0, 255), 600);
+    fadeBacklight(brightPwm(), dimPwm(), 600);
   }
 }
 
@@ -1589,6 +1631,12 @@ void handleRoot() {
   if (matched) html += " style='display:none'";
   html += ">";
 
+  html += F("<h2>Luminosite</h2><div class='card'>");
+  html += F("<label>Luminosite ecran allume (%)</label>");
+  html += "<input type='number' name='bright' min='5' max='100' value='" +
+          String(brightPercent) + "'>";
+  html += F("</div>");
+
   html += F("<h2>Mode veille</h2><div class='card'>");
   html += F("<label><input type='checkbox' name='slpEn' value='1' style='width:auto;margin-right:8px'");
   if (sleepEnabled) html += F(" checked");
@@ -1679,6 +1727,12 @@ void handleSave() {
   getPct("th7w", thresholdWeekly7dWarn);
   getPct("th7a", thresholdWeekly7dAlert);
 
+  // Luminosite ecran allume : 5-100% (en dessous de 5% l'ecran est quasi noir).
+  if (webServer.hasArg("bright")) {
+    int v = webServer.arg("bright").toInt();
+    if (v >= 5 && v <= 100) brightPercent = v;
+  }
+
   // Mode veille : la checkbox HTML n'envoie l'arg que si elle est cochee.
   sleepEnabled = webServer.hasArg("slpEn");
   if (webServer.hasArg("slpDel")) {
@@ -1686,9 +1740,10 @@ void handleSave() {
     if (v >= 1 && v <= 60) sleepDelayMin = v;
   }
   getPct("slpDim", sleepDimPercent);
-  // Si on vient de modifier les reglages, reset le timer d'inactivite et
-  // sortir du mode dim si on y etait pour appliquer immediatement.
+  // Si on vient de modifier les reglages : reset timer + sortir du dim +
+  // appliquer immediatement la nouvelle luminosite "allume".
   wakeFromDim();
+  setBacklight(brightPwm());
 
   savePrefs();
   // Reset du backoff : la prochaine iteration retente immediatement avec
