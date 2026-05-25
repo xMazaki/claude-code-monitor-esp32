@@ -20,6 +20,7 @@ using fs::FS;
 #include <Preferences.h>
 #include <ArduinoOTA.h>
 #include <time.h>
+#include <esp_bt.h>
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 
@@ -49,7 +50,7 @@ String defaultBootView = "clock";
 String tzName = "CET-1CEST,M3.5.0,M10.5.0/3";
 
 // Luminosite du backlight quand l'ecran est "allume" (mode normal).
-int   brightPercent   = 100;            // 0-100%
+int   brightPercent   = 100;
 
 // Mode veille auto : dim du backlight apres un delai sans interaction.
 bool  sleepEnabled    = false;          // active/desactive le mode veille
@@ -222,6 +223,11 @@ void setup() {
   // reset en boucle. La carte a assez de capacite decouplee pour encaisser
   // ces pics, on peut donc desactiver la securite sans dommage.
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
+  // Coupe radio Bluetooth (inutile ici) : economise du courant + thermique.
+  esp_bt_controller_disable();
+  esp_bt_controller_deinit();
+  esp_bt_mem_release(ESP_BT_MODE_BTDM);
 
   Serial.begin(115200);
   Serial.println("\n[BOOT] Claude Code Monitor v1.2");
@@ -771,17 +777,30 @@ void drawHeader() {
   tft.setTextColor(COL_DIM, COL_BG);
   tft.drawString("USAGE MONITOR", 48, 30, 1);
 
+  // Coin droit : ligne 1 = WiFi + RSSI, ligne 2 = temperature CPU.
+  // La temperature aide a reperer la surchauffe du regulateur 3.3V qui
+  // provoque les boot loops au bout d'une longue session.
   tft.setTextDatum(MR_DATUM);
   if (wifiOk) {
-    tft.setTextColor(COL_OK, COL_BG);
-    tft.drawString("WiFi", SCREEN_W - 8, 14, 1);
-    tft.setTextColor(COL_DIM, COL_BG);
     int rssi = WiFi.RSSI();
-    tft.drawString(String(rssi) + "dBm", SCREEN_W - 8, 26, 1);
+    tft.setTextColor(COL_OK, COL_BG);
+    char wifiLine[32];
+    snprintf(wifiLine, sizeof(wifiLine), "WiFi %ddBm", rssi);
+    tft.drawString(wifiLine, SCREEN_W - 8, 14, 1);
   } else {
     tft.setTextColor(COL_DANGER, COL_BG);
     tft.drawString("No WiFi", SCREEN_W - 8, 14, 1);
   }
+
+  // Temperature interne du chip ESP32 (en °C).
+  float tempC = temperatureRead();
+  uint16_t tempColor = COL_DIM;
+  if (tempC >= 70) tempColor = COL_DANGER;
+  else if (tempC >= 55) tempColor = COL_WARN;
+  tft.setTextColor(tempColor, COL_BG);
+  char tempLine[16];
+  snprintf(tempLine, sizeof(tempLine), "%.0f C", tempC);
+  tft.drawString(tempLine, SCREEN_W - 8, 28, 1);
 
   tft.drawFastHLine(8, 41, SCREEN_W - 16, COL_CARD);
 }
