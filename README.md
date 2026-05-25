@@ -10,6 +10,12 @@ Un petit dashboard physique posé sur ton bureau qui affiche en temps réel ton 
 WiFi, mises à jour automatiques, panneau de configuration web, OTA, et UI aux
 couleurs officielles d'Anthropic.
 
+<p align="center">
+  <img src="images/horloge.JPEG" alt="Vue horloge" width="380">
+  &nbsp;&nbsp;
+  <img src="images/jauges.JPEG" alt="Vue jauges" width="380">
+</p>
+
 ## Quick start
 
 > Setup minimal en 5 minutes, le détail est dans la section [Installation](#installation).
